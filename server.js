@@ -5,9 +5,14 @@
  * by the sites' Cloudflare TLS fingerprinting; libcurl passes).
  *
  * Endpoints:
- *   GET /api/movie/{tmdbOrImdbId}                 ?server=1|name  &worker=1  &source=vidfast|vidup
- *   GET /api/tv/{tmdbOrImdbId}/{season}/{episode} ?server=1|name  &worker=1  &source=vidfast|vidup
+ *   GET /api/movie/{tmdbOrImdbId}                 ?server=1|name  &worker=1  &source=vidfast|vidup|auto
+ *   GET /api/tv/{tmdbOrImdbId}/{season}/{episode} ?server=1|name  &worker=1  &source=vidfast|vidup|auto
  *   GET /                                          -> info
+ *
+ * source=auto (default) races BOTH sites in parallel and returns the overall
+ * fastest stream — if one site is challenging your IP, the other still works.
+ * source=vidfast / source=vidup pins one site (legacy behavior).
+ * With ?server=N|name, vidfast is tried first and vidup is the fallback.
  *
  * Run:   npm install && node server.js     (PORT env overrides default 3000)
  */
@@ -28,7 +33,8 @@ const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
 /* Both sites share the same enc-dec handshake; they differ in base url,
-   enc-dec endpoint names and request headers (vidup works without Origin). */
+   enc-dec endpoint names and request headers (vidup works without Origin).
+   Order matters: vidfast is the legacy default and the preferred fallback. */
 const PROVIDERS = {
   vidfast: {
     base: 'https://vidfast.vc',
@@ -48,10 +54,14 @@ const PROVIDERS = {
   },
 };
 
-function normalizeProvider(value) {
-  if (value == null) return null;
+const SOURCE_ORDER = ['vidfast', 'vidup'];
+
+function normalizeSource(value) {
+  if (value == null) return null; // -> auto
   const v = String(value).trim().toLowerCase();
-  return v === 'vidfast' || v === 'vidup' ? v : null;
+  if (v === '' || v === 'auto' || v === 'all' || v === 'both') return null; // auto
+  if (v === 'vidfast' || v === 'vidup') return v;
+  return undefined; // invalid -> caller returns 400
 }
 
 const SERVERS_CACHE_TTL_MS = 15 * 60 * 1000; // server list fresh for 15 min
@@ -131,15 +141,28 @@ async function encDecGet(stage, text, provider) {
   return json.result;
 }
 
-/* ------------------------- payload validation ----------------------- */
+async function decVidfast(text, provider) {
+  const res = await curlRequest(`${ENCDEC_API}/${PROVIDERS[provider].dec}`, {
+    method: 'POST',
+    headers: ['Content-Type: application/json'],
+    body: JSON.stringify({ text }),
+  });
+  const json = safeJson(res.body);
+  if (!json || json.status !== 200) {
+    throw new VidfastError(`${PROVIDERS[provider].dec} failed: ${res.body.slice(0, 160)}`);
+  }
+  return json.result;
+}
+
+/* ------------------------- payload sanity check --------------------- */
 /* The enc-dec handshake embeds payloads in the request URI (enc-vidfast /
-   enc-vidup are GET-only; POST returns 400). A valid stage-1 POST response
-   is a short base64url blob (~300-500 chars). If the site instead serves a
-   Cloudflare challenge / error HTML page (several KB), the encoded URI
-   blows past nginx's request-line limit and the stage request fails with
-   an opaque "414 Request-URI Too Large". Validate BEFORE building the URI
-   so the real cause is surfaced — and retry once, since challenges are
-   transient. */
+   enc-vidup are GET-only; POST returns 400). A valid payload is a short
+   base64-ish blob (~300-500 chars). If the site instead serves a Cloudflare
+   challenge / error HTML page (several KB), the encoded URI blows past
+   nginx's request-line limit and fails with an opaque "414 Request-URI Too
+   Large". Detect that BEFORE building the URI — and only reject on the two
+   conditions that are always fatal (HTML page, huge blob). No charset
+   guessing here: valid payloads may vary and must never be false-rejected. */
 function assertUriPayload(body, source) {
   const text = body.trim();
   if (/<!doctype|<html[\s>]|<body[\s>]|just a moment|cloudflare/i.test(text.slice(0, 400))) {
@@ -156,31 +179,11 @@ function assertUriPayload(body, source) {
       true
     );
   }
-  if (!/^[A-Za-z0-9+/_=-]+$/.test(text)) {
-    throw new VidfastError(
-      `${source} returned an unexpected payload: ${JSON.stringify(text.slice(0, 80))}`,
-      502,
-      true
-    );
-  }
-}
-
-async function decVidfast(text, provider) {
-  const res = await curlRequest(`${ENCDEC_API}/${PROVIDERS[provider].dec}`, {
-    method: 'POST',
-    headers: ['Content-Type: application/json'],
-    body: JSON.stringify({ text }),
-  });
-  const json = safeJson(res.body);
-  if (!json || json.status !== 200) {
-    throw new VidfastError(`${PROVIDERS[provider].dec} failed: ${res.body.slice(0, 160)}`);
-  }
-  return json.result;
 }
 
 /* ------------------------- servers list cache ---------------------- */
 
-const serversCache = new Map(); // key -> { servers, streamBase, csrfToken, fetchedAt, streams }
+const serversCache = new Map(); // key -> { provider, servers, streamBase, csrfToken, fetchedAt, streams }
 const inflight = new Map(); // key -> Promise (dedup concurrent identical fetches)
 
 function mediaKey(provider, type, id, season, episode) {
@@ -238,7 +241,7 @@ async function fetchServersEntryOnce(provider, type, id, season, episode) {
 
   // 2. stage 1 -> upload url + csrf
   const s1 = await encDecGet(1, token, provider);
-  if (DEBUG) console.error(`[debug] stage1 keys=${Object.keys(s1 || {}).join(',')} tokenLen=${((s1 || {}).token || '').length} raw=${JSON.stringify(s1).slice(0, 500)}`);
+  if (DEBUG) console.error(`[debug] stage1 keys=${Object.keys(s1 || {}).join(',')} tokenLen=${((s1 || {}).token || '').length}`);
   // NOTE: the csrf token is OPTIONAL — enc-dec returns "" for vidup.
   // Only send the header when a token is actually present.
   if (!s1.stage1) {
@@ -370,14 +373,14 @@ class VidfastError extends Error {
   }
 }
 
-function findServerIndex(servers, param) {
+function findServerIndex(servers, param, label) {
   const trimmed = String(param).trim();
 
   if (/^\d+$/.test(trimmed)) {
     const n = Number.parseInt(trimmed, 10);
     if (n >= 1 && n <= servers.length) return n - 1;
     throw new VidfastError(
-      `server ${n} is out of range — ${servers.length} server(s) available: ${servers
+      `${label}: server ${n} is out of range — ${servers.length} server(s) available: ${servers
         .map((s, i) => `${i + 1}=${s.name}`)
         .join(', ')}`,
       400
@@ -387,7 +390,7 @@ function findServerIndex(servers, param) {
   const idx = servers.findIndex((s) => s.name.toLowerCase() === trimmed.toLowerCase());
   if (idx === -1) {
     throw new VidfastError(
-      `unknown server "${trimmed}" — available: ${servers
+      `${label}: unknown server "${trimmed}" — available: ${servers
         .map((s, i) => `${i + 1}=${s.name}`)
         .join(', ')}`,
       400
@@ -413,14 +416,39 @@ async function resolveStream(opts) {
   const t0 = performance.now();
   const { type, id, season, episode, serverParam, worker = false } = opts;
 
-  const provider = normalizeProvider(opts.source) || 'vidfast';
-  if (opts.source != null && String(opts.source).trim() !== '' && !normalizeProvider(opts.source)) {
-    throw new VidfastError(`unknown source "${opts.source}" — available: vidfast, vidup`, 400);
+  const pinned = normalizeSource(opts.source);
+  if (pinned === undefined) {
+    throw new VidfastError(
+      `unknown source "${opts.source}" — available: vidfast, vidup, auto`,
+      400
+    );
+  }
+  const sources = pinned ? [pinned] : SOURCE_ORDER; // auto -> both sites
+
+  // Fetch each requested site's server list in parallel; a failing site
+  // must never take the whole request down while the other one works.
+  const settled = await Promise.allSettled(
+    sources.map((s) => getServersEntry(s, type, id, season, episode))
+  );
+  let entries = [];    // { source, entry, cached }
+  const failures = []; // { source, error }
+  settled.forEach((r, i) => {
+    if (r.status === 'fulfilled') entries.push({ source: sources[i], entry: r.value.entry, cached: r.value.cached });
+    else failures.push({ source: sources[i], error: r.reason instanceof Error ? r.reason.message : String(r.reason) });
+  });
+
+  if (entries.length === 0) {
+    throw new VidfastError(
+      `all sources failed: ${failures.map((f) => `${f.source}: ${f.error}`).join(' | ')}`
+    );
   }
 
-  let { entry, cached } = await getServersEntry(provider, type, id, season, episode);
+  const describeSources = () =>
+    entries
+      .map((e) => ({ source: e.source, servers: e.entry.servers.length, cached: e.cached }))
+      .concat(failures.map((f) => ({ source: f.source, error: f.error })));
 
-  const runOne = async (index) => {
+  const runOne = async (entry, index) => {
     const server = entry.servers[index];
     const t1 = performance.now();
     try {
@@ -428,6 +456,7 @@ async function resolveStream(opts) {
       const streamMs = Math.round(performance.now() - t1);
       const probe = await probeStreamUrl(stream.url, `${PROVIDERS[entry.provider].base}/`);
       return {
+        source: entry.provider,
         index: index + 1,
         name: server.name,
         description: server.description,
@@ -441,6 +470,7 @@ async function resolveStream(opts) {
       };
     } catch (e) {
       return {
+        source: entry.provider,
         index: index + 1,
         name: server.name,
         description: server.description,
@@ -456,65 +486,99 @@ async function resolveStream(opts) {
 
   /* ---- explicit server requested ---- */
   if (serverParam) {
-    const index = findServerIndex(entry.servers, serverParam);
+    // In auto mode vidfast is tried first (legacy behavior) and vidup is
+    // the fallback; with an explicit source only that site is used.
+    const attempts = [];
+    for (const { source, entry, cached } of entries) {
+      let index;
+      try {
+        index = findServerIndex(entry.servers, serverParam, source);
+      } catch (e) {
+        attempts.push(`${source}: ${e.message}`);
+        continue;
+      }
 
-    let r = await runOne(index);
-    if (!r.ok && cached) {
-      // stale cache -> refresh once and retry
-      const fresh = await getServersEntry(provider, type, id, season, episode, true);
-      entry = fresh.entry;
-      cached = false;
-      r = await runOne(index);
+      let servedCached = cached;
+      let r = await runOne(entry, index);
+      if (!r.ok && servedCached) {
+        // stale cache -> refresh once and retry
+        const fresh = await getServersEntry(source, type, id, season, episode, true);
+        r = await runOne(fresh.entry, index);
+        servedCached = false;
+      }
+      if (r.ok && r.stream) {
+        return {
+          success: true,
+          type,
+          id,
+          source: r.source,
+          requestedSource: pinned || 'auto',
+          ...(type === 'tv' ? { season, episode } : {}),
+          title: r.stream.title || null,
+          poster: tmdbImage(r.stream.poster),
+          backdrop: tmdbImage(r.stream.backdrop),
+          selectedBy: 'requested',
+          server: {
+            index: r.index,
+            name: r.name,
+            description: r.description,
+            source: r.source,
+            streamMs: r.streamMs,
+            probeMs: r.probeMs,
+            totalMs: r.totalMs,
+          },
+          originalUrl: r.stream.url,
+          url: applyWorkerPrefix(r.stream.url, worker),
+          worker,
+          stream: r.stream,
+          cached: servedCached,
+          elapsedMs: Math.round(performance.now() - t0),
+          fetchedAt: new Date().toISOString(),
+        };
+      }
+      attempts.push(`${source}: server "${serverParam}" (${r.name}) failed: ${r.error || 'unknown error'}`);
     }
-    if (!r.ok || !r.stream) {
-      throw new VidfastError(
-        `server "${serverParam}" (${r.name}) failed: ${r.error || 'unknown error'}`
-      );
-    }
-
-    return {
-      success: true,
-      type,
-      id,
-      source: provider,
-      ...(type === 'tv' ? { season, episode } : {}),
-      title: r.stream.title || null,
-      poster: tmdbImage(r.stream.poster),
-      backdrop: tmdbImage(r.stream.backdrop),
-      selectedBy: 'requested',
-      server: {
-        index: r.index,
-        name: r.name,
-        description: r.description,
-        streamMs: r.streamMs,
-        probeMs: r.probeMs,
-        totalMs: r.totalMs,
-      },
-      originalUrl: r.stream.url,
-      url: applyWorkerPrefix(r.stream.url, worker),
-      worker,
-      stream: r.stream,
-      cached,
-      elapsedMs: Math.round(performance.now() - t0),
-      fetchedAt: new Date().toISOString(),
-    };
+    throw new VidfastError(
+      attempts.length > 0
+        ? `server "${serverParam}" failed: ${attempts.join(' | ')}`
+        : `server "${serverParam}" not resolvable on any available source`
+    );
   }
 
-  /* ---- race all servers, return the fastest ---- */
-  let results = await Promise.all(entry.servers.map((_, i) => runOne(i)));
+  /* ---- race all servers on all sources, return the fastest ---- */
+  const raceAll = (list) =>
+    Promise.all(list.flatMap((e) => e.entry.servers.map((_, i) => runOne(e.entry, i))));
 
-  if (!results.some((r) => r.ok) && cached) {
-    const fresh = await getServersEntry(provider, type, id, season, episode, true);
-    entry = fresh.entry;
-    cached = false;
-    results = await Promise.all(entry.servers.map((_, i) => runOne(i)));
+  let results = await raceAll(entries);
+
+  if (!results.some((r) => r.ok) && entries.some((e) => e.cached)) {
+    // stale cache -> force-refresh every source once and re-race
+    const fresh = await Promise.allSettled(
+      entries.map((e) => getServersEntry(e.source, type, id, season, episode, true))
+    );
+    const refreshed = [];
+    fresh.forEach((r, i) => {
+      if (r.status === 'fulfilled') refreshed.push({ source: entries[i].source, entry: r.value.entry, cached: false });
+    });
+    if (refreshed.length > 0) {
+      entries = refreshed;
+      results = await raceAll(entries);
+    }
   }
 
   const okResults = results.filter((r) => r.ok);
   if (okResults.length === 0) {
+    // every upstream stream POST 404'd across all sources -> almost certainly
+    // a bad/nonexistent media id rather than dead servers
+    if (results.every((r) => /HTTP 404/.test(r.error || ''))) {
+      throw new VidfastError(
+        `media not found — every server on ${[...new Set(results.map((r) => r.source))].join(' + ')} returned HTTP 404 (check the ${type} id)`,
+        404
+      );
+    }
     throw new VidfastError(
       `all ${results.length} servers failed: ${results
-        .map((r) => `${r.name}: ${r.error}`)
+        .map((r) => `${r.source}/${r.name}: ${r.error}`)
         .join(' | ')}`
     );
   }
@@ -529,7 +593,8 @@ async function resolveStream(opts) {
     success: true,
     type,
     id,
-    source: provider,
+    source: winner.source,
+    requestedSource: pinned || 'auto',
     ...(type === 'tv' ? { season, episode } : {}),
     title: winner.stream.title || null,
     poster: tmdbImage(winner.stream.poster),
@@ -539,6 +604,7 @@ async function resolveStream(opts) {
       index: winner.index,
       name: winner.name,
       description: winner.description,
+      source: winner.source,
       streamMs: winner.streamMs,
       probeMs: winner.probeMs,
       totalMs: winner.totalMs,
@@ -548,7 +614,8 @@ async function resolveStream(opts) {
     worker,
     stream: winner.stream,
     servers: results.map(({ stream, ...rest }) => rest),
-    cached,
+    sources: describeSources(),
+    cached: entries.length > 0 && entries.every((e) => e.cached),
     elapsedMs: Math.round(performance.now() - t0),
     fetchedAt: new Date().toISOString(),
   };
@@ -597,11 +664,11 @@ const server = http.createServer(async (req, res) => {
         success: true,
         service: 'stream-resolver-api',
         endpoints: [
-          'GET /api/movie/{tmdbOrImdbId}[?server=1|name][&worker=1][&source=vidfast|vidup]',
-          'GET /api/tv/{tmdbOrImdbId}/{season}/{episode}[?server=1|name][&worker=1][&source=vidfast|vidup]',
+          'GET /api/movie/{tmdbOrImdbId}[?server=1|name][&worker=1][&source=vidfast|vidup|auto]',
+          'GET /api/tv/{tmdbOrImdbId}/{season}/{episode}[?server=1|name][&worker=1][&source=vidfast|vidup|auto]',
         ],
-        sources: Object.keys(PROVIDERS),
-        defaultSource: 'vidfast',
+        sources: ['auto', ...SOURCE_ORDER],
+        defaultSource: 'auto (races vidfast + vidup, returns the fastest)',
         worker: WORKER_URL,
       });
     }
@@ -643,7 +710,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`vidfast-stream-api listening on http://0.0.0.0:${PORT}`);
+  console.log(`stream-resolver-api (vidfast + vidup) listening on http://0.0.0.0:${PORT}`);
 });
 
 process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e));
